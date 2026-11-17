@@ -1,0 +1,212 @@
+#!/bin/bash
+#
+# ISPConfig site log archiver for Debian.
+# Archives compressed site logs by month and retains the current calendar year
+# plus the previous four calendar years.
+
+set -uo pipefail
+
+CLIENTS_ROOT="/var/www/clients"
+LOG_FILE="/var/log/ispconfig-log-archive.log"
+LOCK_FILE="/run/lock/archive-site-logs.lock"
+DRY_RUN=0
+
+usage() {
+    echo "Usage: $0 [--dry-run]"
+}
+
+case "${1:-}" in
+    "") ;;
+    --dry-run) DRY_RUN=1 ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
+
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: This script must run as root." >&2
+    exit 1
+fi
+
+if [[ ! -d "$CLIENTS_ROOT" ]]; then
+    echo "ERROR: Directory not found: $CLIENTS_ROOT" >&2
+    exit 1
+fi
+
+mkdir -p /run/lock || exit 1
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Another execution is already running." >&2
+    exit 1
+fi
+
+touch "$LOG_FILE" || exit 1
+exec >>"$LOG_FILE" 2>&1
+
+echo
+echo "=================================================="
+echo "Execution: $(date --iso-8601=seconds)"
+echo "Dry run: $DRY_RUN"
+echo "=================================================="
+
+CURRENT_YEAR=$(date +%Y)
+TODAY=$(date +%Y%m%d)
+MIN_MONTH="$((CURRENT_YEAR - 4))01"
+
+echo "Today: $TODAY"
+echo "Retention: monthly directories >= $MIN_MONTH"
+
+move_log() {
+    local source="$1"
+    local destination="$2"
+
+    if [[ -e "$destination" ]]; then
+        echo "WARNING: Destination already exists, skipping:"
+        echo "  $destination"
+        return 1
+    fi
+
+    if (( DRY_RUN )); then
+        echo "WOULD MOVE: $source"
+        echo "        TO: $destination"
+        return 0
+    fi
+
+    if ! mkdir -p "$(dirname "$destination")"; then
+        echo "ERROR: Cannot create destination directory."
+        return 1
+    fi
+
+    if ! mv --no-clobber -- "$source" "$destination"; then
+        echo "ERROR: Move failed: $source"
+        return 1
+    fi
+
+    if [[ -e "$source" || ! -e "$destination" ]]; then
+        echo "ERROR: Move could not be verified: $source"
+        return 1
+    fi
+
+    echo "MOVED: $source -> $destination"
+}
+
+SITE_COUNT=0
+MOVED_COUNT=0
+
+while IFS= read -r -d '' LOG_DIR; do
+    ((SITE_COUNT+=1))
+    echo
+    echo "Processing: $LOG_DIR"
+
+    ARCHIVE_ROOT="$LOG_DIR/archive"
+
+    # Access logs are already dated in their filename.
+    while IFS= read -r -d '' FILE; do
+        BASENAME="${FILE##*/}"
+
+        if [[ "$BASENAME" =~ ^([0-9]{8})-access\.log\.gz$ ]]; then
+            FILE_DATE="${BASH_REMATCH[1]}"
+            VALID_DATE=$(date -d "$FILE_DATE" +%Y%m%d 2>/dev/null || true)
+
+            if [[ "$VALID_DATE" != "$FILE_DATE" ]]; then
+                echo "WARNING: Invalid access log date: $BASENAME"
+                continue
+            fi
+
+            if [[ "$FILE_DATE" -ge "$TODAY" ]]; then
+                echo "SKIP: Current or future access log: $BASENAME"
+                continue
+            fi
+
+            YEAR_MONTH="${FILE_DATE:0:6}"
+            DEST="$ARCHIVE_ROOT/$YEAR_MONTH/$BASENAME"
+
+            if move_log "$FILE" "$DEST"; then
+                ((MOVED_COUNT+=1))
+            fi
+        fi
+    done < <(
+        find "$LOG_DIR" -mindepth 1 -maxdepth 1 \
+            -type f -name '????????-access.log.gz' -print0
+    )
+
+    # Error logs carry their rotation number; their archive date is their mtime.
+    declare -A ERROR_DEST_USED=()
+    while IFS= read -r -d '' FILE; do
+        BASENAME="${FILE##*/}"
+
+        if [[ "$BASENAME" =~ ^error\.log\.([0-9]+)\.gz$ ]]; then
+            MTIME=$(stat -c %Y -- "$FILE" 2>/dev/null) || {
+                echo "WARNING: Cannot read mtime: $FILE"
+                continue
+            }
+            FILE_DATE=$(date -d "@$MTIME" +%Y%m%d 2>/dev/null) || {
+                echo "WARNING: Cannot determine date: $FILE"
+                continue
+            }
+
+            if [[ "$FILE_DATE" -ge "$TODAY" ]]; then
+                echo "SKIP: Current or future error log: $BASENAME"
+                continue
+            fi
+
+            YEAR_MONTH="${FILE_DATE:0:6}"
+            DEST="$ARCHIVE_ROOT/$YEAR_MONTH/$FILE_DATE-error.log.gz"
+            SUFFIX=1
+
+            # Only add a suffix when that day's unsuffixed name is occupied.
+            while [[ -e "$DEST" || -n "${ERROR_DEST_USED[$DEST]+x}" ]]; do
+                printf -v SUFFIX_TEXT '%02d' "$SUFFIX"
+                DEST="$ARCHIVE_ROOT/$YEAR_MONTH/$FILE_DATE-error-$SUFFIX_TEXT.log.gz"
+                ((SUFFIX+=1))
+            done
+            ERROR_DEST_USED["$DEST"]=1
+
+            if move_log "$FILE" "$DEST"; then
+                ((MOVED_COUNT+=1))
+            fi
+        fi
+    done < <(
+        find "$LOG_DIR" -mindepth 1 -maxdepth 1 \
+            -type f -name 'error.log.*.gz' -print0
+    )
+
+    # Delete complete archived months older than the five-calendar-year window.
+    if [[ -d "$ARCHIVE_ROOT" ]]; then
+        while IFS= read -r -d '' MONTH_DIR; do
+            MONTH="${MONTH_DIR##*/}"
+
+            if [[ ! "$MONTH" =~ ^[0-9]{4}(0[1-9]|1[0-2])$ ]]; then
+                continue
+            fi
+
+            if [[ "$MONTH" < "$MIN_MONTH" ]]; then
+                if (( DRY_RUN )); then
+                    echo "WOULD DELETE: $MONTH_DIR"
+                else
+                    echo "DELETING: $MONTH_DIR"
+                    if ! rm -rf -- "$MONTH_DIR"; then
+                        echo "ERROR: Could not delete: $MONTH_DIR"
+                    fi
+                fi
+            fi
+        done < <(
+            find "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0
+        )
+    fi
+done < <(
+    find "$CLIENTS_ROOT" -mindepth 3 -maxdepth 3 \
+        -type d -path "$CLIENTS_ROOT/client*/web*/log" -print0
+)
+
+echo
+echo "Sites processed: $SITE_COUNT"
+echo "Files moved/planned: $MOVED_COUNT"
+echo "Execution finished: $(date --iso-8601=seconds)"
+echo "=================================================="
